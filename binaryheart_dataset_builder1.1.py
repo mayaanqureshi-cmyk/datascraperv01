@@ -9,6 +9,9 @@ from collections import deque
 import re
 import io
 from datetime import datetime
+from threading import Lock
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Fix Windows console encoding for emoji support
 if sys.platform == 'win32':
@@ -43,8 +46,8 @@ except ImportError:
 MAX_DOCUMENTS = 25000
 MIN_TEXT_LENGTH = 100
 SAVE_INTERVAL = 100  # Save progress every N documents
-DELAY_MIN = 1.5
-DELAY_MAX = 3.0
+DELAY_MIN = 0.3  # Reduced from 1.5 for faster scraping
+DELAY_MAX = 0.8  # Reduced from 3.0 for faster scraping
 
 # Allowed domains (only crawl these domains)
 ALLOWED_DOMAINS = [
@@ -61,6 +64,11 @@ ALLOWED_DOMAINS = [
     "forums.macrumors.com",
     "discussions.apple.com"
 ]
+
+# Domains that are problematic (rate limiting, blocking, etc.) - skip or handle differently
+PROBLEMATIC_DOMAINS = {
+    "superuser.com": True,  # Currently blocking/rate limiting
+}
 
 # URL patterns to prioritize (these are likely to be good content)
 PRIORITY_PATTERNS = [
@@ -145,8 +153,25 @@ SEED_URLS = [
     # "https://www.reddit.com/r/applehelp/",
 ]
 
-os.makedirs("data/raw", exist_ok=True)
-os.makedirs("data/exports", exist_ok=True)
+# File paths for saved data
+# Get the script's directory to ensure we use the correct paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Check if we're in the datascraper folder, if not, use the datascraper folder
+if "datascraper v.01" in SCRIPT_DIR:
+    BASE_DIR = SCRIPT_DIR
+elif os.path.basename(SCRIPT_DIR) == "Desktop" or "Desktop" in SCRIPT_DIR:
+    # Script is in Desktop, but data is in datascraper v.01 folder
+    BASE_DIR = os.path.join(SCRIPT_DIR, "datascraper v.01")
+else:
+    # Fallback: use script directory
+    BASE_DIR = SCRIPT_DIR
+
+progress_file = os.path.join(BASE_DIR, "data/exports/crawler_progress.json")  # Crawler state (for resuming)
+output_file = os.path.join(BASE_DIR, "data/exports/dataset.jsonl")  # Main dataset (JSONL format: one JSON object per line)
+
+# Create data directories in the correct location
+os.makedirs(os.path.join(BASE_DIR, "data/raw"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "data/exports"), exist_ok=True)
 
 # Load existing progress if available
 visited_urls = set()
@@ -154,9 +179,44 @@ url_queue = deque()
 records = []
 is_resuming = False
 
-# File paths for saved data
-progress_file = "data/exports/crawler_progress.json"  # Crawler state (for resuming)
-output_file = "data/exports/dataset.jsonl"  # Main dataset (JSONL format: one JSON object per line)
+# Create session with connection pooling for faster requests
+def create_session():
+    """Create a requests session with connection pooling and retry strategy"""
+    session = requests.Session()
+    
+    # Configure retry strategy (reduced for speed)
+    try:
+        retry_strategy = Retry(
+            total=1,  # Only retry once for speed
+            backoff_factor=0.1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        
+        # Use HTTPAdapter with connection pooling (reuse connections)
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,  # More connections for parallel requests
+            pool_maxsize=50
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    except:
+        # If urllib3 not available, use basic session
+        pass
+    
+    # Set default headers
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    })
+    
+    return session
+
+# Create global session for connection pooling (faster than creating new sessions)
+http_session = create_session()
 
 if os.path.exists(progress_file):
     print("📂 Loading previous progress...")
@@ -210,6 +270,66 @@ def get_url_priority(url):
             return 1
     return 0
 
+def is_404_page(html):
+    """Check if HTML content indicates a 404 error page"""
+    if not html:
+        return False
+    
+    html_lower = html.lower()
+    
+    # Common 404 error indicators
+    error_indicators = [
+        r"404\s*-\s*page\s*not\s*found",
+        r"404\s*error",
+        r"we\s*couldn't\s*find\s*this\s*page",
+        r"the\s*requested\s*page\s*could\s*not\s*be\s*found",
+        r"document\s*not\s*currently\s*available",
+        r"this\s*page\s*does\s*not\s*exist",
+        r"error\s*404",
+    ]
+    
+    # Check for multiple 404 indicators (more reliable)
+    match_count = 0
+    for pattern in error_indicators:
+        if re.search(pattern, html_lower, re.IGNORECASE):
+            match_count += 1
+    
+    # If we find 2+ indicators, it's likely a 404 page
+    if match_count >= 2:
+        return True
+    
+    # Also check for specific 404 page patterns
+    if "404 - page not found" in html_lower and "we couldn't find this page" in html_lower:
+        return True
+    
+    return False
+
+def is_404_content(text):
+    """Check if text content indicates a 404 error"""
+    if not text or len(text) < 100:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Check for 404 error patterns in content
+    error_patterns = [
+        r"404\s*-\s*page\s*not\s*found",
+        r"we\s*couldn't\s*find\s*this\s*page",
+        r"document\s*not\s*currently\s*available",
+    ]
+    
+    # If content is short and contains 404 indicators, it's likely an error
+    if len(text) < 500:
+        for pattern in error_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+    
+    # Check for repeated 404 messages (common in error pages)
+    if text_lower.count("404") >= 2 or text_lower.count("page not found") >= 2:
+        return True
+    
+    return False
+
 def extract_links(html, base_url):
     """Extract all links from HTML"""
     try:
@@ -246,9 +366,8 @@ def extract_pdf_text(url):
         return None
     
     try:
-        response = requests.get(url, timeout=30, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        # Use session for connection pooling
+        response = http_session.get(url, timeout=20, stream=False)
         if response.status_code != 200:
             return None
         
@@ -702,7 +821,20 @@ def process_content(url, html=None, text=None):
     elif not text:
         # Extract text from HTML
         if html:
-            text = extract(html) or ""
+            # Check for 404 page before processing
+            if is_404_page(html):
+                return None
+            
+            try:
+                text = extract(html) or ""
+            except Exception as e:
+                # Fallback to basic extraction if trafilatura fails
+                try:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, 'html.parser')
+                    text = soup.get_text()
+                except:
+                    return None
         else:
             return None
     
@@ -767,18 +899,59 @@ try:
         visited_urls.add(current_url)
         
         try:
+            # Check if domain is problematic and skip if so
+            parsed_url = urlparse(current_url)
+            domain = parsed_url.netloc.lower().replace('www.', '')
+            if domain in PROBLEMATIC_DOMAINS:
+                # Skip problematic domains to avoid wasting time on connection errors
+                continue
+            
             # Fetch content
             html = None
             if not current_url.lower().endswith('.pdf'):
-                html = fetch_url(current_url)
-                if not html:
-                    response = requests.get(current_url, timeout=15, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    })
+                # Optimized: Use session with connection pooling for faster requests
+                try:
+                    # Use session directly for connection pooling (faster than trafilatura fetch_url)
+                    response = http_session.get(current_url, timeout=10, allow_redirects=True, stream=False)
+                    
+                    # Check status code immediately (before processing)
+                    if response.status_code == 404:
+                        continue  # Skip silently
+                    
+                    if response.status_code >= 400:
+                        continue  # Skip error status codes silently
+                    
+                    # Get HTML content
                     html = response.text
+                    
+                except requests.exceptions.Timeout:
+                    # Skip timeouts silently (reduce noise)
+                    continue
+                except requests.exceptions.ConnectionError as e:
+                    # Connection errors (connection pool exhausted, DNS, etc.)
+                    # Skip silently to avoid spam - these are usually temporary
+                    continue
+                except requests.exceptions.RequestException as e:
+                    # Other request errors - skip silently to reduce noise
+                    continue
+                except Exception as e:
+                    # Skip on other errors
+                    continue
+            
+            # Check if content indicates 404 error page
+            if html and is_404_page(html):
+                continue  # Skip silently
             
             # Process content with parsing and standardization
             qa_pairs = process_content(current_url, html=html)
+            
+            # Additional check: if processed content indicates 404, skip it
+            if qa_pairs:
+                for qa_pair in qa_pairs:
+                    response_text = qa_pair.get("response", "").lower()
+                    if is_404_content(response_text):
+                        qa_pairs = None
+                        break
             
             # Save question/response pairs (standardized format)
             if qa_pairs:
@@ -789,11 +962,38 @@ try:
                 pbar.set_postfix({"collected": documents_collected, "queue": len(url_queue)})
             
             # Extract links for further crawling (only from HTML, not PDFs)
+            # Skip link extraction from problematic domains to avoid adding more problematic URLs
             if documents_collected < MAX_DOCUMENTS and html:
-                links = extract_links(html, current_url)
-                for link in links:
-                    if link not in visited_urls and link not in url_queue:
-                        url_queue.append(link)
+                # Check if domain is problematic - skip link extraction
+                parsed_url = urlparse(current_url)
+                domain = parsed_url.netloc.lower().replace('www.', '')
+                should_extract_links = domain not in PROBLEMATIC_DOMAINS
+                
+                if should_extract_links:
+                    try:
+                        links = extract_links(html, current_url)
+                        # Limit queue size to prevent memory issues
+                        MAX_QUEUE_SIZE = 10000
+                        links_added = 0
+                        for link in links:
+                            # Also skip links to problematic domains
+                            link_parsed = urlparse(link)
+                            link_domain = link_parsed.netloc.lower().replace('www.', '')
+                            if link_domain in PROBLEMATIC_DOMAINS:
+                                continue  # Skip links to problematic domains
+                            
+                            if link not in visited_urls and link not in url_queue:
+                                if len(url_queue) < MAX_QUEUE_SIZE:
+                                    url_queue.append(link)
+                                    links_added += 1
+                                    # Limit links added per page for speed
+                                    if links_added >= 50:  # Max 50 links per page
+                                        break
+                                else:
+                                    break
+                    except Exception as e:
+                        # If link extraction fails, continue with next URL
+                        pass
             
             # Save progress periodically
             if documents_collected % SAVE_INTERVAL == 0:
@@ -801,15 +1001,27 @@ try:
                 save_progress()
                 print(f"\n💾 Progress saved: {documents_collected} documents collected")
             
-            # Rate limiting
-            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            # Rate limiting (reduced delay for faster scraping)
+            # Only delay if we successfully processed a document
+            if qa_pairs:
+                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            else:
+                # Shorter delay for skipped/invalid pages
+                time.sleep(random.uniform(0.1, 0.3))
             
         except requests.exceptions.Timeout:
-            pbar.write(f"⏱️  Timeout: {current_url}")
-        except requests.exceptions.RequestException as e:
-            pbar.write(f"❌ Request error: {current_url} - {str(e)[:50]}")
+            # Skip timeouts silently
+            continue
+        except requests.exceptions.ConnectionError:
+            # Skip connection errors silently (connection pool, DNS, etc.)
+            continue
+        except requests.exceptions.RequestException:
+            # Skip request errors silently
+            continue
         except Exception as e:
-            pbar.write(f"❌ Error: {current_url} - {str(e)[:50]}")
+            # Only log unexpected errors (not network/request errors)
+            # Skip silently to reduce noise - most errors are network-related
+            continue
         
         # Update progress bar
         pbar.set_postfix({"collected": documents_collected, "queue": len(url_queue)})
